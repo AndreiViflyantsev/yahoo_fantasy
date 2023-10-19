@@ -1,0 +1,372 @@
+from yahoo_oauth import OAuth2
+import yahoo_fantasy_api as yfa
+import objectpath
+import pandas as pd
+
+""" Factory for creating various objects"""
+class EntityFactory:
+    @staticmethod
+    def create_entity(entity_type, **kwargs):
+        if entity_type == "Team":
+            return Team(**kwargs)
+        elif entity_type == "Player":
+            return Player(**kwargs)
+        else:
+            raise ValueError(f"Unknown entity type: {entity_type}")
+class Team:
+    def __init__(self, name, stats=None, players=None):
+        self.name = name
+        self.stats = stats or {}
+        self.players = players or []
+class Player:
+    def __init__(self, name, stats=None):
+        self.name = name
+        self.stats = stats or {}
+def extract_team_key(match_data):
+    return match_data.get('team_key', None)
+def extract_team_points(match_data):
+    # Assuming 'points' is a field in match_data, modify accordingly if different
+    return match_data.get('points', None)
+def extract_team_stats(match_data):
+    # Assuming 'stats' is a field in match_data, modify accordingly if different
+    return match_data.get('stats', None)
+# Additional helper functions can be added as needed
+
+"""Batting stats and pitching stats"""
+batting_stats = ['R', 'H', 'HR', 'RBI', 'SB', 'BB', 'SO', 'AVG', 'OPS']
+pitching_stats = ['IP', 'W', 'SV', 'K', 'HLD', 'ERA', 'WHIP', 'K/9', 'BB/9']
+
+class League:
+    def fetch_data(self, data_type, **kwargs):
+        if data_type == 'standings':
+            raw_data = self.fetch_data('standings')
+        elif data_type == 'teams':
+            raw_data = self.fetch_data('teams')
+        elif data_type == 'settings':
+            raw_data = self.fetch_data('settings')
+        else:
+            raise ValueError(f"Unsupported data type: {data_type}")
+        tree_obj = objectpath.Tree(raw_data)
+        if data_type == 'standings':
+            parsed_data = process_standings_data(raw_data)
+        elif data_type == 'teams':
+            parsed_data = process_teams_data(raw_data)
+        elif data_type == 'settings':
+            parsed_data = process_settings_data(raw_data)
+        else:
+            parsed_data = None
+        return parsed_data
+    def __init__(self, sc, league_id):
+        self.sc = sc
+        self.league_id = league_id
+        self.yhandler = yfa.yhandler.YHandler(sc)
+        self.current_week_cache = None
+        self.end_week_cache = None
+        self.week_date_range_cache = {}
+        self.free_agent_cache = {}
+        self.waivers_cache = None
+        self.taken_players_cache = None
+        self.stat_categories_cache = None
+        self.settings_cache = None
+        self.edit_date_cache = None
+        self.positions_cache = None
+        self.stats_id_map = None
+        self.player_details_cache = {}
+    def inject_yhandler(self, yhandler):
+        self.yhandler = yhandler
+    def to_team(self, team_key):
+        tm = yfa.Team(self.sc, team_key)
+        tm.inject_yhandler(self.yhandler)
+        return tm
+    def get_team(self, team_name):
+        """Construct a Team object from a League
+        :param team_name: Team name of the Team object to construct
+        :type team_name: str
+        :return: A dictionary with the team name as the key and team object as the value
+        :rtype: dict
+        """
+        json = self.yhandler.get_league_teams_raw(self.league_id)
+        t = objectpath.Tree(json)
+        team = {}
+        try:
+            team_key = t.execute("$..teams..team[@[2].name is '{}']..team_key[0]".format(team_name))
+            team[team_name] = self.to_team(team_key)
+        except StopIteration:
+            pass
+        return team
+    def standings(self):
+        """Return the standings of the league id
+        >>> lg.standings()[0]
+        {'team_key': '388.l.27081.t.5',
+         'name': 'Lumber Kings',
+         'rank': 1,
+         'playoff_seed': '5',
+         'outcome_totals': {'wins': '121',
+          'losses': '116',
+          'ties': '15',
+          'percentage': '.510'},
+         'games_back': '19'}
+        """
+        json = self.yhandler.get_standings_raw(self.league_id)
+        t = objectpath.Tree(json)
+        num_teams = int(t.execute('$..count[0]'))
+        standings = []
+        for i in range(num_teams):
+            team = {}
+            for e in t.execute('$..teams.."{}".team[0]'.format(i)):
+                if isinstance(e, list):
+                    for td in e:
+                        if "team_key" in td or 'name' in td:
+                            self._merge_dicts(team, td, [])
+                elif "team_standings" in e:
+                    self._merge_dicts(team, e['team_standings'], [])
+            standings.append(team)
+        return standings
+    def teams(self):
+        """Return details of all of the teams in the league.
+        dict_keys(['team_key', 'team_id', 'name', 'is_owned_by_current_login',
+                   'url', 'team_logos', 'waiver_priority', 'number_of_moves',
+                   'number_of_trades', 'roster_adds', 'clinched_playoffs',
+                   'league_scoring_type', 'has_draft_grade',
+                   'auction_budget_total', 'auction_budget_spent', 'managers'])
+        """
+        json = self.yhandler.get_standings_raw(self.league_id)
+        t = objectpath.Tree(json)
+        num_teams = int(t.execute('$..count[0]'))
+        teams = {}
+        for i in range(num_teams):
+            team = {}
+            key = None
+            for e in t.execute('$..teams.."{}".team[0][0]'.format(i)):
+                if "team_key" in e:
+                    key = e['team_key']
+                if isinstance(e, dict):
+                    self._merge_dicts(team, e, [])
+            teams[key] = team
+        return teams
+    def matchups(self, week=None):
+        """Retrieve matchups data for a given week. Defaults to current week.
+        :param week: Week to request, defaults to None
+        :type week: int, optional
+        :return: Matchup details as key/value pairs
+        :rtype: dict
+        """
+        json = self.yhandler.get_scoreboard_raw(self.league_id, week=week)
+        return json
+    def settings(self):
+        """Return the league settings
+        :return: League settings as key/value pairs
+        :rtype: Dict
+        >>> lg.setings()
+        {'league_key': '398.l.10372', 'league_id': '10372', 'name': "Buck you're next!",
+         'url': 'https://baseball.fantasysports.yahoo.com/b1/10372', 'logo_url': False,
+         'draft_status': 'predraft', 'num_teams': 9, 'edit_key': '2020-02-03',
+         'weekly_deadline': '1', 'league_update_timestamp': None, 'scoring_type': 'head',
+         'league_type': 'private', 'renew': '388_27081', 'renewed': '',
+         'iris_group_chat_id': 'ZP2QUJTUB5CPXMXWAVSYZRJI3Y', 'allow_add_to_dl_extra_pos': 0,
+         'is_pro_league': '0', 'is_cash_league': '0', 'current_week': '1', 'start_week': '1',
+         'start_date': '2020-03-26', 'end_week': '24', 'end_date': '2020-09-20',
+         'game_code': 'mlb', 'season': '2020', 'draft_type': 'self', 'is_auction_draft': '0',
+         'uses_playoff': '1', 'has_playoff_consolation_games': True, 'playoff_start_week': '22',
+         'uses_playoff_reseeding': 1, 'uses_lock_eliminated_teams': 0, 'num_playoff_teams': '6',
+         'num_playoff_consolation_teams': 6, 'has_multiweek_championship': 0,
+         'uses_roster_import': '1', 'roster_import_deadline': '2020-03-25', 'waiver_type': 'R',
+         'waiver_rule': 'all', 'uses_faab': '0', 'draft_pick_time': '60',
+         'post_draft_players': 'FA', 'max_teams': '14', 'waiver_time': '2',
+         'trade_end_date': '2020-08-09', 'trade_ratify_type': 'vote', 'trade_reject_time': '2',
+         'player_pool': 'ALL', 'cant_cut_list': 'none', 'can_trade_draft_picks': '1'}
+        """  
+        if self.settings_cache is None:
+            json = self.yhandler.get_settings_raw(self.league_id)
+            data = {}
+            if "fantasy_content" in json:
+                content = json["fantasy_content"]
+                if "league" in content:
+                    self._merge_dicts(data, content["league"][0], [])
+                    """ Filtering out 'roster_positions' and 'stat_categories' because they can be found in other APIs"""
+                    self._merge_dicts(data,
+                                      content["league"][1]["settings"][0],
+                                      ["roster_positions", "stat_categories"])
+            self.settings_cache = data
+        return self.settings_cache
+    def stat_categories(self):
+        """Return the stat categories for a league"""
+        if self.stat_categories_cache is None:
+            t = objectpath.Tree(self.yhandler.get_settings_raw(self.league_id))
+            json = t.execute('$..stat_categories..stat')
+            simple_stat = []
+            for s in json:
+                """ Omit stats that are only for display purposes"""
+                if 'is_only_display_stat' not in s:
+                    simple_stat.append({"display_name": s["display_name"],
+                                        "position_type": s["position_type"]})
+            self.stat_categories_cache = simple_stat
+        return self.stat_categories_cache
+
+""" Creating an OAuth2 object for authentication and access to the Yahoo API """
+sc = OAuth2(None, None, from_file='oaut2.json')
+
+""" Creating a Game object specifying the 'mlb' sports league """
+gm = yfa.Game(sc, 'mlb')
+
+""" Getting IDs of all available leagues """
+leagues = gm.league_ids()
+
+""" Getting a league object based on the identifier '422.l.118709' """
+lg = gm.to_league('422.l.118709')
+
+""" Getting a command object based on the command key """
+teamkey = lg.team_key()
+
+""" Getting a team key based on a league object """
+team = lg.to_team(teamkey)
+
+""" Creating a League object based on the league ID """
+league_obj = League(sc, lg.league_id)
+
+def optimized_assign_team_stats(week):
+    """
+    Creates statistics for teams for the specified week.
+
+    Arguments:
+    week (end): The number of the week.
+
+    Returns:
+    - dict: A dictionary containing team statistics for the specified week.
+    """    
+    matchups = league_obj.matchups(week=week)
+    team_names_dict = {
+        '422.l.118709.t.1': 'Philadelphia_Athletics',
+        '422.l.118709.t.2': 'Plintus_Team',
+        '422.l.118709.t.3': 'Worrying_Gnomes',
+        '422.l.118709.t.4': 'Santa_Clarita',
+        '422.l.118709.t.5': 'Fucking_Raccoon',
+        '422.l.118709.t.6': 'Yugorsk_Dream_Team',
+        '422.l.118709.t.7': 'Elegy_Team',
+        '422.l.118709.t.8': 'Rodeo',
+        '422.l.118709.t.9': 'Babe_the_Ruthless',
+        '422.l.118709.t.10': 'Dubina',
+        '422.l.118709.t.11': 'Mother_of_Doncic',
+        '422.l.118709.t.12': 'Praetor'
+    }
+    teams_stats = {}
+
+    for matchup_index in range(6):
+        for team_index in range(2):
+            stats_path = matchups['fantasy_content']['league'][1]['scoreboard']['0']['matchups'][str(matchup_index)]['matchup']['0']['teams'][str(team_index)]['team'][1]['team_stats']['stats']
+            team_key_path = matchups['fantasy_content']['league'][1]['scoreboard']['0']['matchups'][str(matchup_index)]['matchup']['0']['teams'][str(team_index)]['team'][0][0]['team_key']
+            team_name = team_names_dict.get(team_key_path, 'Team_unknown')
+            teams_stats[team_name] = stats_path
+    return teams_stats
+
+def create_df(data, week_number):
+    """
+    Creates a Data Frame based on statistics data for the specified week.
+
+    Arguments:
+    - data (list): A list with statistics data.
+    - week_number (int): The number of the week.
+
+    Returns:
+    - pandas.DataFrame: Created a DataFrame with the specified data.
+    """
+
+    rows = [x['stat'] for x in data]
+    df = pd.DataFrame(rows)
+    df.set_index('stat_id', inplace=True)
+    df = df.transpose()
+    df.reset_index(inplace=True)
+    df = df.replace('value', f'Stats_week_{week_number}')
+    df.columns = ['name_team_week_number', 'H/AB', 'R', 'H', 'HR', 'RBI', 'SB', 'BB', 'SO', 'AVG', 'OPS', 'IP', 'W', 'SV', 'K', 'HLD', 'ERA', 'WHIP', 'K/9', 'BB/9']
+    return df
+
+def create_dict_of_dfs(data_dict, week_number):
+    """
+    Creates a dictionary from a Data Frame, each of which contains data on the statistics of a certain team for a specified week.
+
+    Arguments:
+    - data_dict (dict): A dictionary with data on team statistics.
+    - week_number (int): The number of the week.
+
+    Returns:
+    - dict: A dictionary in which the keys are the names of commands with the added prefix 'stats_week_{weeknumber}' and the values corresponding to the DataFrame.
+    """
+
+    result_dict = {}
+    for name, data in data_dict.items():
+        df = create_df(data, week_number)
+        result_dict[f'{name}_stats_week_{week_number}'] = df
+    return result_dict
+
+""" Creating a dictionary with keys and values, where keys are team IDs and values are team names """
+team_keys = {
+    '422.l.118709.t.1': 'Philadelphia_Athletics',
+    '422.l.118709.t.2': 'Plintus_Team',
+    '422.l.118709.t.3': 'Worrying_Gnomes',
+    '422.l.118709.t.4': 'Santa_Clarita',
+    '422.l.118709.t.5': 'Fucking_Raccoon',
+    '422.l.118709.t.6': 'Yugorsk_Dream_Team',
+    '422.l.118709.t.7': 'Elegy_Team',
+    '422.l.118709.t.8': 'Rodeo',
+    '422.l.118709.t.9': 'Babe_the_Ruthless',
+    '422.l.118709.t.10': 'Dubina',
+    '422.l.118709.t.11': 'Mother_of_Doncic',
+    '422.l.118709.t.12': 'Praetor'
+}
+
+def create_week_data(week_number):
+    """
+    Создает набор данных для указанной недели.
+
+    Аргументы:
+    - week_number (int): Номер недели.
+
+    Возвращает:
+    - dict: Словарь, содержащий данные о статистике команд для указанной недели.
+    """    
+    teams_stats = optimized_assign_team_stats(week=week_number)
+    result_dict = create_dict_of_dfs(teams_stats, week_number)
+    return result_dict
+
+
+all_week_data = {}
+for week_number in range(1, 23):
+    week_data = create_week_data(week_number)
+    all_week_data[f'Week_{week_number}'] = week_data
+
+def get_team_data(team_name, start_week=1, end_week=23):
+    """
+    Returns team data for the specified range of weeks.
+
+   Arguments:
+   - team_name (str): The name of the team.
+   - start_week (int): The number of the initial week (by default 1).
+   - end_week (end): The number of the end week (by default 23).
+
+   Returns:
+   - pandas.DataFrame: Summary data about the team for the specified range of weeks.
+   """
+    dfs_team = []
+    for week_number in range(start_week, end_week + 1):
+        if f'Week_{week_number}' in all_week_data and f'{team_name}_stats_week_{week_number}' in all_week_data[f'Week_{week_number}']:
+            df_week = all_week_data[f'Week_{week_number}'][f'{team_name}_stats_week_{week_number}']
+            dfs_team.append(df_week)
+    df_team = pd.concat(dfs_team)
+    df_team = df_team.transpose()
+    return df_team
+
+""" Extracting data for teames"""
+df_Philadelphia_Athletics= get_team_data('Philadelphia_Athletics')
+df_Plintus_Team = get_team_data('Plintus_Team')
+df_Worrying_Gnomes = get_team_data('Worrying_Gnomes')
+df_Santa_Clarita = get_team_data('Santa_Clarita')
+df_Fucking_Raccoon = get_team_data('Fucking_Raccoon')
+df_Yugorsk_Dream_Team = get_team_data('Yugorsk_Dream_Team')
+df_Elegy_Team = get_team_data('Elegy_Team')
+df_Rodeo = get_team_data('Rodeo')
+df_Babe_the_Ruthless = get_team_data('Babe_the_Ruthless')
+df_Dubina = get_team_data('Dubina')
+df_Mother_of_Doncic = get_team_data('Mother_of_Doncic')
+df_Praetor = get_team_data('Praetor')
+
+df_Philadelphia_Athletics.to_csv('df_Philadelphia.csv')
